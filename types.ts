@@ -4,7 +4,7 @@ export interface Vector3 {
   z: number;
 }
 
-export type EnemyType = 'peasant' | 'knight' | 'heavy';
+export type EnemyType = 'peasant' | 'knight' | 'heavy' | 'villager';
 
 export interface Enemy {
   id: string;
@@ -14,6 +14,15 @@ export interface Enemy {
   maxHp: number;
   speed: number;
   isAttacking: boolean;
+}
+
+export interface Obstacle {
+  id: string;
+  type: 'tree' | 'rock' | 'ruin' | 'mountain' | 'house';
+  position: Vector3;
+  rotation: number;
+  scale: Vector3;
+  radius: number; // Collision radius
 }
 
 export interface GameState {

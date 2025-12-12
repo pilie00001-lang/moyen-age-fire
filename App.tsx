@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useRef, Suspense, useMemo } from 'react';
+import React, { useState, useEffect, useRef, Suspense, useMemo, useCallback } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { PointerLockControls, Sky, Stars, Stats, Text, useKeyboardControls, KeyboardControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { Vector3 as ThreeVector3, Raycaster } from 'three';
-import { Enemy, EnemyType, GameState, WeaponState } from './types';
+import { Enemy, EnemyType, GameState, WeaponState, Obstacle } from './types';
 import { Joystick } from './components/Joystick';
 import { generateBattleCommentary } from './services/gemini';
 
@@ -14,41 +14,312 @@ const ENEMY_SPAWN_RATE = 2000; // ms
 const DAMAGE_PER_SHOT = 35;
 const MAX_AMMO = 30;
 
+// World Gen Constants
+const CHUNK_SIZE = 60;
+const CHUNK_RES = 30; // Vertex resolution per chunk (higher = smoother)
+const RENDER_DISTANCE = 2; // Chunks radius (2 = 5x5 grid)
+
 // Enemy Stats Config
 const ENEMY_CONFIG: Record<EnemyType, { hp: number; speed: number; score: number; scale: number; color: string }> = {
   peasant: { hp: 40, speed: 7, score: 50, scale: 0.8, color: '#8B4513' }, // Fast, weak, brown
   knight: { hp: 100, speed: 4, score: 100, scale: 1.0, color: '#666666' }, // Balanced, grey
   heavy: { hp: 300, speed: 2.5, score: 300, scale: 1.4, color: '#2F4F4F' }, // Slow, tanky, dark slate
+  villager: { hp: 30, speed: 5, score: -100, scale: 0.8, color: '#3b82f6' }, // Blue, harmless, penalty for killing
 };
 
-// --- Components ---
+// --- Noise & Height Logic ---
 
-// 1. The Weapon (AK-47 Style)
+// Simple Pseudo-Random Noise (Deterministic)
+const noise = (x: number, z: number) => {
+    const sin = Math.sin(x * 12.9898 + z * 78.233);
+    const s = sin * 43758.5453123;
+    return s - Math.floor(s);
+}
+
+// Smooth Noise (Interpolated)
+const smoothNoise = (x: number, z: number) => {
+    const i = Math.floor(x);
+    const j = Math.floor(z);
+    const f = x - i;
+    const g = z - j;
+    
+    // Corners
+    const a = noise(i, j);
+    const b = noise(i + 1, j);
+    const c = noise(i, j + 1);
+    const d = noise(i + 1, j + 1);
+    
+    // Quintic interpolation curve
+    const u = f * f * f * (f * (f * 6 - 15) + 10);
+    const v = g * g * g * (g * (g * 6 - 15) + 10);
+    
+    return (1 - u) * (1 - v) * a + 
+           u * (1 - v) * b + 
+           (1 - u) * v * c + 
+           u * v * d;
+}
+
+// Fractal Brownian Motion for nice terrain
+const getTerrainHeight = (x: number, z: number) => {
+    let y = 0;
+    let amp = 10;
+    let freq = 0.02; // Scale: smaller = wider hills
+    
+    // 3 Octaves
+    y += smoothNoise(x * freq, z * freq) * amp;
+    y += smoothNoise(x * freq * 2, z * freq * 2) * (amp / 2);
+    y += smoothNoise(x * freq * 4, z * freq * 4) * (amp / 4);
+    
+    // Add some "floor" so it's not too crazy
+    return Math.pow(y, 1.2); 
+};
+
+// --- Helper: Seeded Random ---
+const seededRandom = (seed: number) => {
+    const x = Math.sin(seed) * 10000;
+    return x - Math.floor(x);
+};
+
+// --- Procedural Generation Logic (Chunk Based) ---
+const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
+  const obstacles: Obstacle[] = [];
+  const chunkSeed = chunkX * 73856093 ^ chunkZ * 19349663; 
+  const getRand = (offset: number) => seededRandom(chunkSeed + offset);
+
+  const worldX = chunkX * CHUNK_SIZE;
+  const worldZ = chunkZ * CHUNK_SIZE;
+
+  // Village Logic (5% Chance per chunk)
+  const isVillage = getRand(999) > 0.95;
+
+  if (isVillage) {
+      // Spawn a village cluster
+      const houseCount = 4 + Math.floor(getRand(888) * 4);
+      for(let i=0; i<houseCount; i++) {
+          const lx = (getRand(i*30) - 0.5) * (CHUNK_SIZE * 0.6);
+          const lz = (getRand(i*30+1) - 0.5) * (CHUNK_SIZE * 0.6);
+          const wx = worldX + lx;
+          const wz = worldZ + lz;
+          const y = getTerrainHeight(wx, wz);
+
+          obstacles.push({
+              id: `${chunkX}:${chunkZ}:house:${i}`,
+              type: 'house',
+              position: { x: wx, y: y, z: wz },
+              rotation: getRand(i * 30 + 2) * Math.PI * 2,
+              scale: { x: 1, y: 1, z: 1 },
+              radius: 2.5
+          });
+      }
+      // Fewer trees in villages
+  }
+
+  // 1. Trees
+  const treeCount = isVillage ? 2 : Math.floor(getRand(1) * 10) + 2; 
+  for (let i = 0; i < treeCount; i++) {
+      const lx = getRand(i * 10) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const lz = getRand(i * 10 + 1) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const wx = worldX + lx;
+      const wz = worldZ + lz;
+      const y = getTerrainHeight(wx, wz);
+
+      // Simple collision check against houses if in village (rough)
+      if (isVillage) {
+          let tooClose = false;
+          obstacles.forEach(o => {
+              if (o.type === 'house') {
+                  const dx = wx - o.position.x;
+                  const dz = wz - o.position.z;
+                  if (Math.sqrt(dx*dx+dz*dz) < 4) tooClose = true;
+              }
+          });
+          if (tooClose) continue;
+      }
+
+      obstacles.push({
+          id: `${chunkX}:${chunkZ}:tree:${i}`,
+          type: 'tree',
+          position: { x: wx, y: y, z: wz },
+          rotation: getRand(i * 10 + 2) * Math.PI,
+          scale: { x: 1 + getRand(i)*0.5, y: 1 + getRand(i+5), z: 1 + getRand(i)*0.5 },
+          radius: 1
+      });
+  }
+
+  // 2. Rocks
+  const rockCount = Math.floor(getRand(2) * 5) + 2;
+  for (let i = 0; i < rockCount; i++) {
+      const lx = getRand(i * 20 + 50) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const lz = getRand(i * 20 + 51) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const wx = worldX + lx;
+      const wz = worldZ + lz;
+      const y = getTerrainHeight(wx, wz);
+
+      obstacles.push({
+          id: `${chunkX}:${chunkZ}:rock:${i}`,
+          type: 'rock',
+          position: { x: wx, y: y, z: wz },
+          rotation: getRand(i * 20 + 52) * Math.PI,
+          scale: { x: 1, y: 1, z: 1 },
+          radius: 1.5
+      });
+  }
+
+  // 3. Ruins (Very Rare, not in villages)
+  if (!isVillage && getRand(100) > 0.85) {
+      const lx = getRand(101) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const lz = getRand(102) * CHUNK_SIZE - (CHUNK_SIZE/2);
+      const wx = worldX + lx;
+      const wz = worldZ + lz;
+      const y = getTerrainHeight(wx, wz);
+      
+      obstacles.push({
+          id: `${chunkX}:${chunkZ}:ruin`,
+          type: 'ruin',
+          position: { x: wx, y: y, z: wz },
+          rotation: getRand(103) * Math.PI,
+          scale: { x: 1 + getRand(104), y: 1 + getRand(105), z: 1 + getRand(104) },
+          radius: 3.5
+      });
+  }
+
+  return obstacles;
+};
+
+// --- Environment Components ---
+
+const TerrainChunk = React.memo(({ x, z }: { x: number, z: number }) => {
+    // Generate geometry on mount
+    const geometry = useMemo(() => {
+        const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, CHUNK_RES, CHUNK_RES);
+        geo.rotateX(-Math.PI / 2); // Rotate to XZ plane
+        
+        const pos = geo.attributes.position;
+        const worldX = x * CHUNK_SIZE;
+        const worldZ = z * CHUNK_SIZE;
+
+        for (let i = 0; i < pos.count; i++) {
+            const px = pos.getX(i) + worldX; // Local to World
+            const pz = pos.getZ(i) + worldZ;
+            const h = getTerrainHeight(px, pz);
+            pos.setY(i, h);
+        }
+        
+        geo.computeVertexNormals();
+        return geo;
+    }, [x, z]);
+
+    return (
+        <mesh 
+            geometry={geometry} 
+            position={[x * CHUNK_SIZE, 0, z * CHUNK_SIZE]} 
+            receiveShadow
+        >
+             {/* Grass-like material */}
+            <meshStandardMaterial color="#2d4c1e" roughness={0.8} />
+        </mesh>
+    );
+});
+
+const House: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+  <group position={[data.position.x, data.position.y, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
+     {/* Base */}
+     <mesh position={[0, 1, 0]} castShadow>
+        <boxGeometry args={[2.5, 2, 2.5]} />
+        <meshStandardMaterial color="#6d4c41" />
+     </mesh>
+     {/* Roof */}
+     <mesh position={[0, 2.5, 0]} rotation={[0, Math.PI/4, 0]} castShadow>
+        <coneGeometry args={[2.2, 1.5, 4]} />
+        <meshStandardMaterial color="#3e2723" />
+     </mesh>
+     {/* Door */}
+     <mesh position={[0, 0.8, 1.26]}>
+         <planeGeometry args={[0.8, 1.4]} />
+         <meshStandardMaterial color="#1a1a1a" />
+     </mesh>
+     {/* Window */}
+     <mesh position={[0.8, 1.2, 1.26]}>
+         <planeGeometry args={[0.5, 0.5]} />
+         <meshStandardMaterial color="#87ceeb" emissive="#444" />
+     </mesh>
+  </group>
+));
+
+const Tree: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+  <group position={[data.position.x, data.position.y, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
+    <mesh position={[0, 1, 0]} castShadow>
+      <cylinderGeometry args={[0.2, 0.4, 2, 8]} />
+      <meshStandardMaterial color="#4d3319" />
+    </mesh>
+    <mesh position={[0, 3, 0]} castShadow>
+      <coneGeometry args={[1.5, 4, 8]} />
+      <meshStandardMaterial color="#1a4d1a" />
+    </mesh>
+    <mesh position={[0, 4.5, 0]} castShadow>
+      <coneGeometry args={[1.2, 3, 8]} />
+      <meshStandardMaterial color="#266626" />
+    </mesh>
+  </group>
+));
+
+const Rock: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+  <mesh 
+    position={[data.position.x, data.position.y + 0.5 * data.scale.y, data.position.z]} 
+    rotation={[data.rotation, data.rotation, data.rotation]} 
+    scale={[data.scale.x, data.scale.y, data.scale.z]}
+    castShadow
+  >
+    <dodecahedronGeometry args={[1.2, 0]} />
+    <meshStandardMaterial color="#595959" roughness={0.9} />
+  </mesh>
+));
+
+const Mountain: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+    // Deprecated for procedural terrain, but kept for legacy ID support if needed
+  <mesh position={[data.position.x, data.position.y - 5, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
+    <coneGeometry args={[1, 1, 4]} />
+    <meshStandardMaterial color="#2d2d2d" roughness={1} />
+  </mesh>
+));
+
+const Ruin: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+  <group position={[data.position.x, data.position.y, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
+    <mesh position={[-1.5, 1, 0]} castShadow>
+      <boxGeometry args={[1, 2, 3]} />
+      <meshStandardMaterial color="#7a7a7a" />
+    </mesh>
+    <mesh position={[1.5, 0.5, 1]} castShadow>
+      <boxGeometry args={[1, 1, 1.5]} />
+      <meshStandardMaterial color="#7a7a7a" />
+    </mesh>
+    <mesh position={[1.5, 1.5, -1]} castShadow>
+      <cylinderGeometry args={[0.3, 0.3, 3, 6]} />
+      <meshStandardMaterial color="#8a8a8a" />
+    </mesh>
+  </group>
+));
+
+
+// --- Game Components ---
+
 const Weapon = ({ isFiring, isReloading }: { isFiring: boolean; isReloading: boolean }) => {
   const group = useRef<THREE.Group>(null);
   const flashRef = useRef<THREE.Mesh>(null);
-  const { camera } = useThree();
-
+  
   useFrame((state) => {
     if (!group.current) return;
-    
-    // Sway
     const t = state.clock.getElapsedTime();
     const swayX = Math.sin(t * 2) * 0.002;
     const swayY = Math.cos(t * 2) * 0.002;
-    
-    // Recoil
     const recoilZ = isFiring ? 0.05 + Math.random() * 0.02 : 0;
     const recoilX = isFiring ? (Math.random() - 0.5) * 0.02 : 0;
-    
-    // Reload animation
     const reloadRot = isReloading ? -Math.PI / 4 : 0;
     const reloadPos = isReloading ? -0.2 : 0;
 
     group.current.position.set(0.3 + swayX, -0.25 + swayY + reloadPos, -0.5 + recoilZ);
     group.current.rotation.set(recoilX, reloadRot, 0);
 
-    // Muzzle Flash
     if (flashRef.current) {
         flashRef.current.visible = isFiring && Math.random() > 0.5;
         flashRef.current.rotation.z = Math.random() * Math.PI;
@@ -57,27 +328,22 @@ const Weapon = ({ isFiring, isReloading }: { isFiring: boolean; isReloading: boo
 
   return (
     <group ref={group}>
-      {/* Body */}
       <mesh position={[0, 0, 0]} castShadow>
         <boxGeometry args={[0.08, 0.1, 0.6]} />
         <meshStandardMaterial color="#3a3a3a" roughness={0.7} />
       </mesh>
-      {/* Wood Stock */}
       <mesh position={[0, -0.05, 0.2]}>
         <boxGeometry args={[0.08, 0.15, 0.3]} />
         <meshStandardMaterial color="#8B4513" />
       </mesh>
-      {/* Barrel */}
       <mesh position={[0, 0.02, -0.4]}>
         <cylinderGeometry args={[0.015, 0.02, 0.4]} />
         <meshStandardMaterial color="#1a1a1a" />
       </mesh>
-      {/* Magazine */}
       <mesh position={[0, -0.15, -0.1]} rotation={[0.2, 0, 0]}>
         <boxGeometry args={[0.06, 0.25, 0.1]} />
         <meshStandardMaterial color="#8B4513" />
       </mesh>
-      {/* Muzzle Flash */}
       <mesh ref={flashRef} position={[0, 0.02, -0.65]} visible={false}>
         <planeGeometry args={[0.3, 0.3]} />
         <meshBasicMaterial color="#FFDD00" transparent opacity={0.8} />
@@ -86,25 +352,23 @@ const Weapon = ({ isFiring, isReloading }: { isFiring: boolean; isReloading: boo
   );
 };
 
-// 2. Enemy Mesh (Varied Types)
 const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; type: EnemyType }> = ({ position, hp, maxHp, type }) => {
   const mesh = useRef<THREE.Group>(null);
   const config = ENEMY_CONFIG[type];
   
   useFrame((state) => {
     if (!mesh.current) return;
-    // Simple bobbing - heavier enemies bob slower
-    const bobSpeed = type === 'peasant' ? 15 : type === 'heavy' ? 5 : 10;
-    mesh.current.position.y = (0.75 * config.scale) + Math.sin(state.clock.getElapsedTime() * bobSpeed + position.x) * 0.1;
+    const bobSpeed = type === 'peasant' || type === 'villager' ? 15 : type === 'heavy' ? 5 : 10;
+    const terrainH = getTerrainHeight(position.x, position.z);
+    mesh.current.position.y = terrainH + (0.75 * config.scale) + Math.sin(state.clock.getElapsedTime() * bobSpeed + position.x) * 0.1;
   });
 
-  // Health bar color
   const hpPercent = hp / maxHp;
   const hpColor = hpPercent > 0.5 ? 'green' : hpPercent > 0.2 ? 'orange' : 'red';
+  const isVillager = type === 'villager';
 
   return (
-    <group ref={mesh} position={position} scale={[config.scale, config.scale, config.scale]}>
-      {/* Body */}
+    <group ref={mesh} position={[position.x, position.y, position.z]} scale={[config.scale, config.scale, config.scale]}>
       <mesh position={[0, 0, 0]} castShadow>
         <boxGeometry args={[0.6, 1.5, 0.4]} />
         <meshStandardMaterial color={config.color} roughness={0.9} />
@@ -114,13 +378,20 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
       <mesh position={[0, 0.9, 0]}>
         <sphereGeometry args={[0.25]} />
         <meshStandardMaterial 
-          color={type === 'peasant' ? '#d2b48c' : '#888'} 
-          metallic={type !== 'peasant'} 
-          roughness={type === 'peasant' ? 1 : 0.2} 
+          color={type === 'peasant' ? '#d2b48c' : isVillager ? '#f1c27d' : '#888'} 
+          metallic={!isVillager && type !== 'peasant'} 
+          roughness={type === 'peasant' || isVillager ? 1 : 0.2} 
         />
       </mesh>
+      
+      {/* Villager Hat */}
+      {isVillager && (
+          <mesh position={[0, 1.1, 0]}>
+              <cylinderGeometry args={[0.3, 0.3, 0.05]} />
+              <meshStandardMaterial color="#8B4513" />
+          </mesh>
+      )}
 
-      {/* Heavy Details (Shoulder Pads / Bulk) */}
       {type === 'heavy' && (
         <mesh position={[0, 0.5, 0]}>
           <boxGeometry args={[0.9, 0.5, 0.6]} />
@@ -128,60 +399,45 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
         </mesh>
       )}
 
-      {/* Weapon Arm */}
-      <group position={[0.4, 0.2, 0.2]} rotation={[1, 0, 0]}>
-        <mesh>
-            <boxGeometry args={[0.1, 0.5, 0.1]} />
-            <meshStandardMaterial color={config.color} />
-        </mesh>
-        
-        {/* Weapon Visuals */}
-        {type === 'peasant' ? (
-          // Pitchfork
-          <group position={[0, 0.6, 0]}>
-             <mesh position={[0, 0, 0]}>
-                <cylinderGeometry args={[0.02, 0.02, 1.5]} />
-                <meshStandardMaterial color="#5C4033" />
-             </mesh>
-             <mesh position={[0, 0.75, 0]} rotation={[0,0,1.57]}>
-                 <cylinderGeometry args={[0.02, 0.02, 0.3]} />
-                 <meshStandardMaterial color="#888" />
-             </mesh>
-             <mesh position={[-0.1, 0.9, 0]}>
-                 <cylinderGeometry args={[0.01, 0.01, 0.4]} />
-                 <meshStandardMaterial color="#888" />
-             </mesh>
-             <mesh position={[0, 0.9, 0]}>
-                 <cylinderGeometry args={[0.01, 0.01, 0.4]} />
-                 <meshStandardMaterial color="#888" />
-             </mesh>
-             <mesh position={[0.1, 0.9, 0]}>
-                 <cylinderGeometry args={[0.01, 0.01, 0.4]} />
-                 <meshStandardMaterial color="#888" />
-             </mesh>
-          </group>
-        ) : type === 'heavy' ? (
-          // Greatsword
-           <group position={[0, 0.8, 0]}>
-             <mesh>
-                 <boxGeometry args={[0.1, 1.8, 0.05]} />
-                 <meshStandardMaterial color="#ccc" metallic roughness={0.1} />
-             </mesh>
-             <mesh position={[0, -0.6, 0]}>
-                 <boxGeometry args={[0.4, 0.1, 0.1]} />
-                 <meshStandardMaterial color="#222" />
-             </mesh>
-           </group>
-        ) : (
-          // Standard Sword
-          <mesh position={[0, 0.5, 0]}>
-            <boxGeometry args={[0.05, 1.2, 0.02]} />
-            <meshStandardMaterial color="#eee" metallic roughness={0.1} />
-          </mesh>
-        )}
-      </group>
+      {/* Arms/Weapon */}
+      {!isVillager && (
+        <group position={[0.4, 0.2, 0.2]} rotation={[1, 0, 0]}>
+            <mesh>
+                <boxGeometry args={[0.1, 0.5, 0.1]} />
+                <meshStandardMaterial color={config.color} />
+            </mesh>
+            
+            {type === 'peasant' ? (
+            <group position={[0, 0.6, 0]}>
+                <mesh position={[0, 0, 0]}>
+                    <cylinderGeometry args={[0.02, 0.02, 1.5]} />
+                    <meshStandardMaterial color="#5C4033" />
+                </mesh>
+                <mesh position={[0, 0.75, 0]} rotation={[0,0,1.57]}>
+                    <cylinderGeometry args={[0.02, 0.02, 0.3]} />
+                    <meshStandardMaterial color="#888" />
+                </mesh>
+            </group>
+            ) : type === 'heavy' ? (
+            <group position={[0, 0.8, 0]}>
+                <mesh>
+                    <boxGeometry args={[0.1, 1.8, 0.05]} />
+                    <meshStandardMaterial color="#ccc" metallic roughness={0.1} />
+                </mesh>
+                <mesh position={[0, -0.6, 0]}>
+                    <boxGeometry args={[0.4, 0.1, 0.1]} />
+                    <meshStandardMaterial color="#222" />
+                </mesh>
+            </group>
+            ) : (
+            <mesh position={[0, 0.5, 0]}>
+                <boxGeometry args={[0.05, 1.2, 0.02]} />
+                <meshStandardMaterial color="#eee" metallic roughness={0.1} />
+            </mesh>
+            )}
+        </group>
+      )}
 
-      {/* HP Bar */}
       <mesh position={[0, 1.4, 0]}>
          <planeGeometry args={[1 * hpPercent, 0.1]} />
          <meshBasicMaterial color={hpColor} />
@@ -190,7 +446,6 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
   );
 };
 
-// 3. Bullets / Tracers
 const Tracers = ({ tracers }: { tracers: { start: ThreeVector3; end: ThreeVector3; id: number }[] }) => {
     return (
         <group>
@@ -204,28 +459,128 @@ const Tracers = ({ tracers }: { tracers: { start: ThreeVector3; end: ThreeVector
     )
 }
 
-// 4. Ground & Environment
-const World = () => {
+// Manages the visible terrain patches
+const World = ({ obstacles, playerPos }: { obstacles: Obstacle[], playerPos: THREE.Vector3 }) => {
+    const cx = Math.floor(playerPos.x / CHUNK_SIZE);
+    const cz = Math.floor(playerPos.z / CHUNK_SIZE);
+    
+    // Calculate visible chunk coordinates
+    const visibleChunks = useMemo(() => {
+        const chunks = [];
+        for (let x = cx - RENDER_DISTANCE; x <= cx + RENDER_DISTANCE; x++) {
+            for (let z = cz - RENDER_DISTANCE; z <= cz + RENDER_DISTANCE; z++) {
+                chunks.push({ x, z, key: `${x}:${z}` });
+            }
+        }
+        return chunks;
+    }, [cx, cz]);
+
   return (
     <>
       <Sky sunPosition={[100, 20, 100]} />
       <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
       <ambientLight intensity={0.5} />
-      <pointLight position={[10, 10, 10]} intensity={1} castShadow />
+      <pointLight position={[10, 50, 10]} intensity={1} castShadow />
       
-      {/* Floor */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]} receiveShadow>
-        <planeGeometry args={[1000, 1000]} />
-        <meshStandardMaterial color="#2d4c1e" />
-      </mesh>
+      {/* Dynamic Terrain */}
+      {visibleChunks.map(chunk => (
+          <TerrainChunk key={chunk.key} x={chunk.x} z={chunk.z} />
+      ))}
       
-      {/* Grids for reference */}
-      <gridHelper args={[1000, 100]} position={[0, 0.01, 0]} />
+      {/* Obstacles */}
+      {obstacles.map(obs => {
+        switch(obs.type) {
+          case 'tree': return <Tree key={obs.id} data={obs} />;
+          case 'rock': return <Rock key={obs.id} data={obs} />;
+          case 'ruin': return <Ruin key={obs.id} data={obs} />;
+          case 'mountain': return <Mountain key={obs.id} data={obs} />;
+          case 'house': return <House key={obs.id} data={obs} />;
+          default: return null;
+        }
+      })}
     </>
   );
 };
 
-// 5. Game Logic Controller
+// Collision Helper
+const checkCollision = (position: THREE.Vector3, obstacles: Obstacle[], radius: number): boolean => {
+  for (const obs of obstacles) {
+    const dx = position.x - obs.position.x;
+    const dz = position.z - obs.position.z;
+    
+    if (Math.abs(dx) > 20 || Math.abs(dz) > 20) continue;
+
+    const distSq = dx * dx + dz * dz;
+    const minDist = obs.radius + radius;
+    if (distSq < minDist * minDist) {
+      return true;
+    }
+  }
+  return false;
+};
+
+// --- World Generator System ---
+// Monitors player position and updates the global obstacles list
+const WorldGenerator = ({ 
+    playerRef, 
+    setObstacles 
+}: { 
+    playerRef: React.MutableRefObject<THREE.Vector3>, 
+    setObstacles: React.Dispatch<React.SetStateAction<Obstacle[]>> 
+}) => {
+    const loadedChunks = useRef<Set<string>>(new Set());
+    const lastChunk = useRef<{x: number, z: number} | null>(null);
+
+    useFrame(() => {
+        const px = playerRef.current.x;
+        const pz = playerRef.current.z;
+        const chunkX = Math.floor(px / CHUNK_SIZE);
+        const chunkZ = Math.floor(pz / CHUNK_SIZE);
+
+        if (!lastChunk.current || lastChunk.current.x !== chunkX || lastChunk.current.z !== chunkZ) {
+            lastChunk.current = { x: chunkX, z: chunkZ };
+            
+            const newObstacles: Obstacle[] = [];
+            const activeKeys = new Set<string>();
+
+            for (let x = chunkX - RENDER_DISTANCE; x <= chunkX + RENDER_DISTANCE; x++) {
+                for (let z = chunkZ - RENDER_DISTANCE; z <= chunkZ + RENDER_DISTANCE; z++) {
+                    const key = `${x}:${z}`;
+                    activeKeys.add(key);
+                    
+                    if (!loadedChunks.current.has(key)) {
+                        loadedChunks.current.add(key);
+                        newObstacles.push(...generateChunk(x, z));
+                    }
+                }
+            }
+            
+            if (newObstacles.length > 0) {
+                setObstacles(prev => {
+                    const filtered = prev.filter(obs => {
+                        const parts = obs.id.split(':');
+                        const cx = parseInt(parts[0]);
+                        const cz = parseInt(parts[1]);
+                        return Math.abs(cx - chunkX) <= RENDER_DISTANCE + 1 && Math.abs(cz - chunkZ) <= RENDER_DISTANCE + 1;
+                    });
+                    
+                    const currentLoaded = new Set<string>();
+                    filtered.forEach(obs => {
+                         const parts = obs.id.split(':');
+                         currentLoaded.add(`${parts[0]}:${parts[1]}`);
+                    });
+                    loadedChunks.current = currentLoaded;
+                    activeKeys.forEach(k => loadedChunks.current.add(k));
+
+                    return [...filtered, ...newObstacles];
+                });
+            }
+        }
+    });
+
+    return null;
+}
+
 const GameController = ({ 
     onScore, 
     onDamage, 
@@ -233,7 +588,8 @@ const GameController = ({
     setAmmo, 
     onShoot,
     enemiesRef,
-    playerRef
+    playerRef,
+    obstacles
 }: { 
     onScore: (pts: number) => void, 
     onDamage: (dmg: number) => void, 
@@ -241,13 +597,13 @@ const GameController = ({
     setAmmo: (ammo: number) => void,
     onShoot: (fired: boolean) => void,
     enemiesRef: React.MutableRefObject<Enemy[]>,
-    playerRef: React.MutableRefObject<THREE.Vector3>
+    playerRef: React.MutableRefObject<THREE.Vector3>,
+    obstacles: Obstacle[]
 }) => {
   const { camera } = useThree();
   const [enemies, setEnemies] = useState<Enemy[]>([]);
   const [tracers, setTracers] = useState<{ start: ThreeVector3; end: ThreeVector3; id: number }[]>([]);
   
-  // Game State Refs
   const lastShotTime = useRef(0);
   const lastSpawnTime = useRef(0);
   const isMouseDown = useRef(false);
@@ -258,7 +614,6 @@ const GameController = ({
     enemiesRef.current = enemies;
   }, [enemies]);
 
-  // Input Handling
   useEffect(() => {
     const onDown = () => { isMouseDown.current = true; };
     const onUp = () => { isMouseDown.current = false; };
@@ -280,8 +635,7 @@ const GameController = ({
 
   const reload = () => {
     isReloading.current = true;
-    onShoot(false); // Stop firing anim
-    // Update UI state handled by weapon component visually
+    onShoot(false); 
     setTimeout(() => {
         ammoRef.current = MAX_AMMO;
         setAmmo(MAX_AMMO);
@@ -294,20 +648,31 @@ const GameController = ({
     const playerPos = camera.position;
     playerRef.current.copy(playerPos);
 
-    // --- Movement (Keyboard + Joystick) ---
+    // --- Movement (Joystick) ---
     const speed = PLAYER_SPEED * delta;
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
     const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
     
-    // Flatten vectors to run on ground
     forward.y = 0; forward.normalize();
     right.y = 0; right.normalize();
     
-    // Joystick Input
     if (joystickData.x !== 0 || joystickData.y !== 0) {
-        camera.position.add(right.clone().multiplyScalar(joystickData.x * speed));
-        camera.position.add(forward.clone().multiplyScalar(-joystickData.y * speed));
+        const moveVec = new THREE.Vector3()
+           .add(right.clone().multiplyScalar(joystickData.x * speed))
+           .add(forward.clone().multiplyScalar(-joystickData.y * speed));
+        
+        const nextPos = camera.position.clone().add(moveVec);
+        if (!checkCollision(nextPos, obstacles, 0.5)) {
+            camera.position.x = nextPos.x;
+            camera.position.z = nextPos.z;
+        }
     }
+
+    // --- SNAP TO TERRAIN ---
+    // Important: Keep player above ground
+    const groundH = getTerrainHeight(camera.position.x, camera.position.z);
+    // Smooth transition or hard snap? Hard snap for walking.
+    camera.position.y = groundH + 1.7; 
 
     // --- Shooting ---
     if (isMouseDown.current && !isReloading.current && time - lastShotTime.current > FIRE_RATE) {
@@ -317,27 +682,23 @@ const GameController = ({
         setAmmo(ammoRef.current);
         onShoot(true);
         
-        // Raycast
         const raycaster = new Raycaster();
         raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
         
-        // Visual Tracer
         const start = new THREE.Vector3(0.2, -0.2, -0.5).applyQuaternion(camera.quaternion).add(camera.position);
-        const end = raycaster.ray.at(50, new THREE.Vector3()); // Default end
+        const end = raycaster.ray.at(50, new THREE.Vector3()); 
         
-        // Hit detection
         let hitDist = 50;
         let hitId: string | null = null;
         
-        // We must update state
         setEnemies(prev => {
             let hitTypeScore = 0;
             const updatedEnemies = prev.map(e => {
                 const config = ENEMY_CONFIG[e.type];
+                // Hitbox slightly higher than origin
                 const ePos = new THREE.Vector3(e.position.x, e.position.y + (0.75 * config.scale), e.position.z);
                 const distToRay = raycaster.ray.distanceSqToPoint(ePos);
                 
-                // If aiming close to center of enemy (adjusted for scale)
                 if (distToRay < (0.5 * config.scale) && e.hp > 0) {
                    const dist = camera.position.distanceTo(ePos);
                    if (dist < hitDist) {
@@ -354,45 +715,39 @@ const GameController = ({
                     return { ...e, hp: newHp };
                 }
                 return e;
-            }).filter(e => {
-                // Remove dead bodies immediately or could leave them as ragdolls later
-                return e.hp > 0;
-            });
+            }).filter(e => e.hp > 0);
             
             if (hitTypeScore > 0) onScore(hitTypeScore);
             return updatedEnemies;
         });
 
-        // Add tracer
         const tracerId = Math.random();
         setTracers(prev => [...prev, { start, end, id: tracerId }]);
         setTimeout(() => setTracers(prev => prev.filter(t => t.id !== tracerId)), 100);
 
       } else {
-        onShoot(false); // Click empty
+        onShoot(false); 
         if (ammoRef.current === 0) reload();
       }
     } else if (!isMouseDown.current) {
         onShoot(false);
     }
 
-    // --- Enemy Spawning ---
+    // --- Enemy/Villager Spawning ---
     if (time - lastSpawnTime.current > ENEMY_SPAWN_RATE) {
       lastSpawnTime.current = time;
-      // Spawn random angle distance 20-30
       const angle = Math.random() * Math.PI * 2;
-      const dist = 25 + Math.random() * 15;
-      const spawnPos = new THREE.Vector3(
-          camera.position.x + Math.cos(angle) * dist,
-          0,
-          camera.position.z + Math.sin(angle) * dist
-      );
+      const dist = 30 + Math.random() * 20;
+      const spawnX = camera.position.x + Math.cos(angle) * dist;
+      const spawnZ = camera.position.z + Math.sin(angle) * dist;
+      const spawnY = getTerrainHeight(spawnX, spawnZ);
       
-      // Randomize Type
       const rand = Math.random();
       let type: EnemyType = 'knight';
-      if (rand < 0.5) type = 'peasant';
-      else if (rand > 0.85) type = 'heavy';
+      // 20% Villager, 30% Peasant, 40% Knight, 10% Heavy
+      if (rand < 0.2) type = 'villager';
+      else if (rand < 0.5) type = 'peasant';
+      else if (rand > 0.9) type = 'heavy';
 
       const config = ENEMY_CONFIG[type];
 
@@ -401,10 +756,10 @@ const GameController = ({
           { 
               id: Math.random().toString(), 
               type: type,
-              position: { x: spawnPos.x, y: 0, z: spawnPos.z }, 
+              position: { x: spawnX, y: spawnY, z: spawnZ }, 
               hp: config.hp,
               maxHp: config.hp,
-              speed: config.speed + (Math.random() - 0.5), // slight variation
+              speed: config.speed + (Math.random() - 0.5), 
               isAttacking: false 
           }
       ]);
@@ -419,23 +774,53 @@ const GameController = ({
             const pVec = new THREE.Vector3(camera.position.x, 0, camera.position.z);
             const dist = eVec.distanceTo(pVec);
             
+            // Villager AI: Passive / Flee
+            if (e.type === 'villager') {
+                if (dist < 10) {
+                   // Flee from player
+                   const dir = eVec.sub(pVec).normalize();
+                   const moveVec = dir.multiplyScalar(e.speed * delta);
+                   const nextPos = new THREE.Vector3(e.position.x, 0, e.position.z).add(moveVec);
+                   
+                   if (!checkCollision(nextPos, obstacles, 0.5)) {
+                        return { ...e, position: { x: nextPos.x, y: 0, z: nextPos.z }, isAttacking: false };
+                   }
+                } else {
+                   // Wander randomly (simple jitter)
+                   if (Math.random() < 0.05) {
+                       const angle = Math.random() * Math.PI * 2;
+                       const moveVec = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)).multiplyScalar(e.speed * delta * 0.5);
+                        const nextPos = new THREE.Vector3(e.position.x, 0, e.position.z).add(moveVec);
+                        if (!checkCollision(nextPos, obstacles, 0.5)) {
+                             return { ...e, position: { x: nextPos.x, y: 0, z: nextPos.z }, isAttacking: false };
+                        }
+                   }
+                }
+                return { ...e, isAttacking: false };
+            }
+
+            // Aggressive Enemy AI
             const config = ENEMY_CONFIG[e.type];
             const attackRange = 1.5 * config.scale;
 
             if (dist > attackRange) {
-                // Move towards player
                 const dir = pVec.sub(eVec).normalize();
-                eVec.add(dir.multiplyScalar(e.speed * delta));
-                return { ...e, position: { x: eVec.x, y: 0, z: eVec.z }, isAttacking: false };
+                const moveVec = dir.multiplyScalar(e.speed * delta);
+                const nextPos = eVec.clone().add(moveVec);
+
+                if (!checkCollision(nextPos, obstacles, 0.5)) {
+                    // Update Y later in render loop, just update XZ here
+                    return { ...e, position: { x: nextPos.x, y: 0, z: nextPos.z }, isAttacking: false };
+                }
+                return { ...e, isAttacking: false };
             } else {
-                // Attack range
                 takingDamage = true;
                 return { ...e, isAttacking: true };
             }
         });
 
         if (takingDamage) {
-            onDamage(0.5); // Damage per frame close contact
+            onDamage(0.5); 
         }
         
         return next;
@@ -459,9 +844,8 @@ const GameController = ({
   );
 };
 
-
-// 6. Keyboard Mover Hook
-function KeyboardMover() {
+// Keyboard Mover Hook with Collision
+function KeyboardMover({ obstacles }: { obstacles: Obstacle[] }) {
   const [, get] = useKeyboardControls()
   const { camera } = useThree()
   
@@ -474,16 +858,17 @@ function KeyboardMover() {
     const sideVec = new THREE.Vector3(0, 0, 0)
     const direction = new THREE.Vector3()
 
-    // Front/Back
     frontVec.set(0, 0, Number(backward) - Number(forward))
-    // Left/Right
     sideVec.set(Number(left) - Number(right), 0, 0)
 
     direction.subVectors(frontVec, sideVec).normalize().multiplyScalar(speed).applyEuler(camera.rotation)
     
-    // Lock Y movement (stay on ground)
-    camera.position.x += direction.x
-    camera.position.z += direction.z
+    const nextPos = camera.position.clone().add(new THREE.Vector3(direction.x, 0, direction.z));
+    
+    if (!checkCollision(nextPos, obstacles, 0.5)) {
+        camera.position.x = nextPos.x;
+        camera.position.z = nextPos.z;
+    }
   })
   return null
 }
@@ -500,28 +885,23 @@ export default function App() {
   const [commentary, setCommentary] = useState("Chronos AK-47 Loaded. Press Start.");
   const [isFiring, setIsFiring] = useState(false);
   const [joystickData, setJoystickData] = useState({ x: 0, y: 0 });
-  
-  // Refs for complex game loop logic access
-  const enemiesRef = useRef<Enemy[]>([]);
-  const playerRef = useRef(new THREE.Vector3());
+  const [obstacles, setObstacles] = useState<Obstacle[]>([]);
 
-  // Commentary Loop
+  // Refs
+  const enemiesRef = useRef<Enemy[]>([]);
+  const playerRef = useRef(new THREE.Vector3(0,0,0));
+
   useEffect(() => {
     if (!gameState.isPlaying) return;
-    
-    // Initial Intro
     generateBattleCommentary('intro', 0, 1).then(setCommentary);
-
   }, [gameState.isPlaying]);
 
-  // Killstreak check
   useEffect(() => {
       if (gameState.score > 0 && gameState.score % 500 === 0) {
           generateBattleCommentary('killstreak', gameState.score, gameState.wave).then(setCommentary);
       }
   }, [gameState.score]);
 
-  // Low HP check
   useEffect(() => {
       if (gameState.health < 30 && gameState.health > 0) {
           generateBattleCommentary('low_health', gameState.score, gameState.wave).then(setCommentary);
@@ -539,7 +919,7 @@ export default function App() {
   const handleDamage = (amount: number) => {
       setGameState(prev => {
           const newHp = Math.max(0, prev.health - amount);
-          if (newHp === 0) return { ...prev, isPlaying: false }; // Game Over
+          if (newHp === 0) return { ...prev, isPlaying: false }; 
           return { ...prev, health: newHp };
       });
   };
@@ -552,7 +932,6 @@ export default function App() {
       setIsFiring(firing);
   }
 
-  // Keyboard map
   const map = useMemo(()=>[
     { name: 'forward', keys: ['ArrowUp', 'w', 'W'] },
     { name: 'backward', keys: ['ArrowDown', 's', 'S'] },
@@ -564,27 +943,22 @@ export default function App() {
   return (
     <div className="w-full h-screen bg-black relative overflow-hidden">
         {/* --- UI OVERLAYS --- */}
-        
-        {/* Crosshair */}
         {gameState.isPlaying && <div className="crosshair border-2 border-white rounded-full bg-white/30 backdrop-blur-sm z-10" />}
         
         {/* HUD */}
         {gameState.isPlaying && (
             <div className="absolute inset-0 pointer-events-none z-20 p-4 md:p-8 flex flex-col justify-between">
-                {/* Top Bar */}
                 <div className="flex justify-between items-start">
                     <div className="bg-black/50 p-4 rounded-lg text-white font-mono backdrop-blur">
                         <div className="text-2xl font-bold text-yellow-400">SCORE: {gameState.score}</div>
                         <div className="text-sm text-gray-300">WAVE: {gameState.wave}</div>
                     </div>
-                    {/* Gemini Commentary Box */}
                     <div className="bg-blue-900/60 p-4 rounded-lg text-cyan-200 font-mono max-w-md backdrop-blur border-l-4 border-cyan-500">
                         <div className="text-xs uppercase tracking-widest mb-1 opacity-70">Battle AI Log</div>
                         <p className="text-sm md:text-base italic">"{commentary}"</p>
                     </div>
                 </div>
 
-                {/* Bottom Bar */}
                 <div className="flex justify-between items-end">
                     <div className="bg-black/50 p-4 rounded-lg backdrop-blur">
                         <div className="text-sm text-gray-400 mb-1">HEALTH</div>
@@ -604,10 +978,9 @@ export default function App() {
             </div>
         )}
 
-        {/* Joystick (Mobile Only - Visual only appears on logic but we render always for touch devices technically) */}
+        {/* Joystick */}
         {gameState.isPlaying && (
             <div className="absolute inset-0 z-30 pointer-events-none">
-                 {/* Only enable pointer events on the joystick area */}
                  <div className="pointer-events-auto w-full h-full relative">
                     <Joystick onMove={handleJoystick} />
                  </div>
@@ -641,13 +1014,15 @@ export default function App() {
 
         {/* 3D Scene */}
         <KeyboardControls map={map}>
-            <Canvas shadows camera={{ fov: 75, position: [0, 1.7, 0] }}>
+            <Canvas shadows camera={{ fov: 75, position: [0, 5, 0] }}>
                 <Suspense fallback={null}>
-                    <World />
+                    {/* Pass player pos to World to render correct chunks */}
+                    <World obstacles={obstacles} playerPos={playerRef.current} />
+                    <WorldGenerator playerRef={playerRef} setObstacles={setObstacles} />
                     {gameState.isPlaying && (
                         <>
-                            <PointerLockControls selector="#root" /> {/* Standard mouse lock for PC */}
-                            <KeyboardMover />
+                            <PointerLockControls selector="#root" /> 
+                            <KeyboardMover obstacles={obstacles} />
                             <GameController 
                                 onScore={handleScore}
                                 onDamage={handleDamage}
@@ -656,33 +1031,24 @@ export default function App() {
                                 onShoot={onShoot}
                                 enemiesRef={enemiesRef}
                                 playerRef={playerRef}
+                                obstacles={obstacles}
                             />
-                            {/* Weapon attached to camera via Drei or manually updated? 
-                                Simplest in R3F: Put it in a group that follows camera, 
-                                but PointerLockControls moves the camera object itself.
-                                We can just parent the weapon to the camera using createPortal or just simple logic.
-                                ACTUALLY: The best way without complex rigs is to use a component that uses useFrame to clamp to camera.
-                            */}
                             <WeaponRig isFiring={isFiring} isReloading={gameState.ammo === 0 && isFiring} />
                         </>
                     )}
                 </Suspense>
-                {/* Stats for dev performance monitoring */}
-                {/* <Stats /> */}
             </Canvas>
         </KeyboardControls>
     </div>
   );
 }
 
-// Helper to attach weapon to camera view
 const WeaponRig = ({ isFiring, isReloading }: { isFiring: boolean, isReloading: boolean }) => {
     const { camera } = useThree();
     const ref = useRef<THREE.Group>(null);
     
     useFrame(() => {
         if (!ref.current) return;
-        // Smoothly interpolate position to camera to avoid jitter, or hard lock
         ref.current.position.copy(camera.position);
         ref.current.quaternion.copy(camera.quaternion);
     });
