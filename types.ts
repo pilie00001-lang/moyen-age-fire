@@ -18,7 +18,7 @@ export interface Enemy {
 
 export interface Obstacle {
   id: string;
-  type: 'tree' | 'rock' | 'ruin' | 'mountain' | 'house';
+  type: 'tree' | 'rock' | 'ruin' | 'mountain' | 'house' | 'signpost';
   position: Vector3;
   rotation: number;
   scale: Vector3;

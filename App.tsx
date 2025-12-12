@@ -29,25 +29,26 @@ const ENEMY_CONFIG: Record<EnemyType, { hp: number; speed: number; score: number
 
 // --- Noise & Height Logic ---
 
-// Simple Pseudo-Random Noise (Deterministic)
-const noise = (x: number, z: number) => {
-    const sin = Math.sin(x * 12.9898 + z * 78.233);
+// Simple Pseudo-Random Noise (Deterministic based on coords + seed)
+const noise = (x: number, z: number, seed: number) => {
+    // Add seed to shift the noise pattern
+    const sin = Math.sin(x * 12.9898 + z * 78.233 + (seed % 1000));
     const s = sin * 43758.5453123;
     return s - Math.floor(s);
 }
 
 // Smooth Noise (Interpolated)
-const smoothNoise = (x: number, z: number) => {
+const smoothNoise = (x: number, z: number, seed: number) => {
     const i = Math.floor(x);
     const j = Math.floor(z);
     const f = x - i;
     const g = z - j;
     
     // Corners
-    const a = noise(i, j);
-    const b = noise(i + 1, j);
-    const c = noise(i, j + 1);
-    const d = noise(i + 1, j + 1);
+    const a = noise(i, j, seed);
+    const b = noise(i + 1, j, seed);
+    const c = noise(i, j + 1, seed);
+    const d = noise(i + 1, j + 1, seed);
     
     // Quintic interpolation curve
     const u = f * f * f * (f * (f * 6 - 15) + 10);
@@ -59,19 +60,50 @@ const smoothNoise = (x: number, z: number) => {
            u * v * d;
 }
 
+// SmoothStep Helper
+const smoothStep = (edge0: number, edge1: number, x: number) => {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+}
+
+// Calculate if a point is on a road (0 = no road, 1 = center of road)
+const getRoadInfluence = (x: number, z: number, seed: number) => {
+    const scale = 0.005; // Less frequent, longer roads
+    const n = smoothNoise(x * scale, z * scale, seed);
+    
+    // We look for a narrow band around 0.5 to create "rivers" of roads
+    const dist = Math.abs(n - 0.5);
+    const roadWidth = 0.04; // Slightly wider
+    
+    if (dist < roadWidth) {
+        return smoothStep(roadWidth, 0, dist); 
+    }
+    return 0;
+}
+
 // Fractal Brownian Motion for nice terrain
-const getTerrainHeight = (x: number, z: number) => {
+const getTerrainHeight = (x: number, z: number, seed: number) => {
     let y = 0;
     let amp = 10;
     let freq = 0.02; // Scale: smaller = wider hills
     
-    // 3 Octaves
-    y += smoothNoise(x * freq, z * freq) * amp;
-    y += smoothNoise(x * freq * 2, z * freq * 2) * (amp / 2);
-    y += smoothNoise(x * freq * 4, z * freq * 4) * (amp / 4);
+    // 3 Octaves of noise for base terrain
+    y += smoothNoise(x * freq, z * freq, seed) * amp;
+    y += smoothNoise(x * freq * 2, z * freq * 2, seed) * (amp / 2);
+    y += smoothNoise(x * freq * 4, z * freq * 4, seed) * (amp / 4);
     
-    // Add some "floor" so it's not too crazy
-    return Math.pow(y, 1.2); 
+    let height = Math.pow(Math.abs(y), 1.2); 
+
+    // Flatten terrain on roads
+    const road = getRoadInfluence(x, z, seed);
+    if (road > 0) {
+        // Force height towards a "road level" which is just the low-frequency terrain
+        // This cuts through small hills
+        const smoothBase = smoothNoise(x * freq, z * freq, seed) * amp; 
+        height = height * (1 - road) + (smoothBase * road);
+    }
+
+    return height;
 };
 
 // --- Helper: Seeded Random ---
@@ -81,26 +113,38 @@ const seededRandom = (seed: number) => {
 };
 
 // --- Procedural Generation Logic (Chunk Based) ---
-const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
+const generateChunk = (chunkX: number, chunkZ: number, worldSeed: number): Obstacle[] => {
   const obstacles: Obstacle[] = [];
-  const chunkSeed = chunkX * 73856093 ^ chunkZ * 19349663; 
+  const chunkSeed = chunkX * 73856093 ^ chunkZ * 19349663 ^ Math.floor(worldSeed); 
   const getRand = (offset: number) => seededRandom(chunkSeed + offset);
 
   const worldX = chunkX * CHUNK_SIZE;
   const worldZ = chunkZ * CHUNK_SIZE;
 
-  // Village Logic (5% Chance per chunk)
-  const isVillage = getRand(999) > 0.95;
+  // Check road presence at chunk center to bias village generation
+  const centerX = worldX + CHUNK_SIZE / 2;
+  const centerZ = worldZ + CHUNK_SIZE / 2;
+  const centerRoadInf = getRoadInfluence(centerX, centerZ, worldSeed);
+  
+  // Village Logic: High chance if near road
+  let villageChance = 0.98; // Base chance (2%)
+  if (centerRoadInf > 0.05) villageChance = 0.6; // High chance if near road
+
+  const isVillage = getRand(999) > villageChance;
 
   if (isVillage) {
       // Spawn a village cluster
       const houseCount = 4 + Math.floor(getRand(888) * 4);
       for(let i=0; i<houseCount; i++) {
-          const lx = (getRand(i*30) - 0.5) * (CHUNK_SIZE * 0.6);
-          const lz = (getRand(i*30+1) - 0.5) * (CHUNK_SIZE * 0.6);
+          const lx = (getRand(i*30) - 0.5) * (CHUNK_SIZE * 0.7);
+          const lz = (getRand(i*30+1) - 0.5) * (CHUNK_SIZE * 0.7);
           const wx = worldX + lx;
           const wz = worldZ + lz;
-          const y = getTerrainHeight(wx, wz);
+          
+          // Don't spawn houses directly ON the road
+          if (getRoadInfluence(wx, wz, worldSeed) > 0.5) continue;
+
+          const y = getTerrainHeight(wx, wz, worldSeed);
 
           obstacles.push({
               id: `${chunkX}:${chunkZ}:house:${i}`,
@@ -111,7 +155,6 @@ const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
               radius: 2.5
           });
       }
-      // Fewer trees in villages
   }
 
   // 1. Trees
@@ -121,9 +164,13 @@ const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
       const lz = getRand(i * 10 + 1) * CHUNK_SIZE - (CHUNK_SIZE/2);
       const wx = worldX + lx;
       const wz = worldZ + lz;
-      const y = getTerrainHeight(wx, wz);
 
-      // Simple collision check against houses if in village (rough)
+      // Don't spawn trees on roads
+      if (getRoadInfluence(wx, wz, worldSeed) > 0.3) continue;
+
+      const y = getTerrainHeight(wx, wz, worldSeed);
+
+      // Simple collision check against houses
       if (isVillage) {
           let tooClose = false;
           obstacles.forEach(o => {
@@ -146,14 +193,34 @@ const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
       });
   }
 
-  // 2. Rocks
+  // 2. Rocks & Signposts
   const rockCount = Math.floor(getRand(2) * 5) + 2;
   for (let i = 0; i < rockCount; i++) {
       const lx = getRand(i * 20 + 50) * CHUNK_SIZE - (CHUNK_SIZE/2);
       const lz = getRand(i * 20 + 51) * CHUNK_SIZE - (CHUNK_SIZE/2);
       const wx = worldX + lx;
       const wz = worldZ + lz;
-      const y = getTerrainHeight(wx, wz);
+      
+      const roadInf = getRoadInfluence(wx, wz, worldSeed);
+      
+      // Spawn signposts occasionally along the road edge
+      if (roadInf > 0.2 && roadInf < 0.6 && getRand(i*100) > 0.7) {
+         const y = getTerrainHeight(wx, wz, worldSeed);
+         obstacles.push({
+             id: `${chunkX}:${chunkZ}:sign:${i}`,
+             type: 'signpost',
+             position: { x: wx, y: y, z: wz },
+             rotation: getRand(i * 20 + 52) * Math.PI * 2,
+             scale: { x: 1, y: 1, z: 1 },
+             radius: 0.5
+         });
+         continue; // Don't spawn a rock here
+      }
+
+      // Don't spawn rocks on roads
+      if (roadInf > 0.4) continue;
+
+      const y = getTerrainHeight(wx, wz, worldSeed);
 
       obstacles.push({
           id: `${chunkX}:${chunkZ}:rock:${i}`,
@@ -171,7 +238,8 @@ const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
       const lz = getRand(102) * CHUNK_SIZE - (CHUNK_SIZE/2);
       const wx = worldX + lx;
       const wz = worldZ + lz;
-      const y = getTerrainHeight(wx, wz);
+
+      const y = getTerrainHeight(wx, wz, worldSeed);
       
       obstacles.push({
           id: `${chunkX}:${chunkZ}:ruin`,
@@ -188,26 +256,51 @@ const generateChunk = (chunkX: number, chunkZ: number): Obstacle[] => {
 
 // --- Environment Components ---
 
-const TerrainChunk = React.memo(({ x, z }: { x: number, z: number }) => {
-    // Generate geometry on mount
+const TerrainChunk = React.memo(({ x, z, seed }: { x: number, z: number, seed: number }) => {
     const geometry = useMemo(() => {
         const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, CHUNK_RES, CHUNK_RES);
         geo.rotateX(-Math.PI / 2); // Rotate to XZ plane
         
+        const count = geo.attributes.position.count;
         const pos = geo.attributes.position;
+        const colors = new Float32Array(count * 3); // RGB for each vertex
+        
         const worldX = x * CHUNK_SIZE;
         const worldZ = z * CHUNK_SIZE;
 
-        for (let i = 0; i < pos.count; i++) {
-            const px = pos.getX(i) + worldX; // Local to World
+        // Base Colors
+        const grassColor = new THREE.Color("#2d4c1e");
+        const roadColor = new THREE.Color("#d2b48c"); // Sand/Tan
+        const tempColor = new THREE.Color();
+
+        for (let i = 0; i < count; i++) {
+            const px = pos.getX(i) + worldX; 
             const pz = pos.getZ(i) + worldZ;
-            const h = getTerrainHeight(px, pz);
+            
+            // Height
+            const h = getTerrainHeight(px, pz, seed);
             pos.setY(i, h);
+
+            // Color (Road vs Grass)
+            const roadInf = getRoadInfluence(px, pz, seed);
+            
+            if (roadInf > 0) {
+                tempColor.lerpColors(grassColor, roadColor, roadInf);
+            } else {
+                const noiseVal = smoothNoise(px * 0.1, pz * 0.1, seed);
+                tempColor.set(grassColor);
+                tempColor.offsetHSL(0, 0, noiseVal * 0.05); 
+            }
+
+            colors[i * 3] = tempColor.r;
+            colors[i * 3 + 1] = tempColor.g;
+            colors[i * 3 + 2] = tempColor.b;
         }
         
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
         geo.computeVertexNormals();
         return geo;
-    }, [x, z]);
+    }, [x, z, seed]);
 
     return (
         <mesh 
@@ -215,30 +308,25 @@ const TerrainChunk = React.memo(({ x, z }: { x: number, z: number }) => {
             position={[x * CHUNK_SIZE, 0, z * CHUNK_SIZE]} 
             receiveShadow
         >
-             {/* Grass-like material */}
-            <meshStandardMaterial color="#2d4c1e" roughness={0.8} />
+            <meshStandardMaterial vertexColors roughness={0.9} />
         </mesh>
     );
 });
 
 const House: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
   <group position={[data.position.x, data.position.y, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
-     {/* Base */}
      <mesh position={[0, 1, 0]} castShadow>
         <boxGeometry args={[2.5, 2, 2.5]} />
         <meshStandardMaterial color="#6d4c41" />
      </mesh>
-     {/* Roof */}
      <mesh position={[0, 2.5, 0]} rotation={[0, Math.PI/4, 0]} castShadow>
         <coneGeometry args={[2.2, 1.5, 4]} />
         <meshStandardMaterial color="#3e2723" />
      </mesh>
-     {/* Door */}
      <mesh position={[0, 0.8, 1.26]}>
          <planeGeometry args={[0.8, 1.4]} />
          <meshStandardMaterial color="#1a1a1a" />
      </mesh>
-     {/* Window */}
      <mesh position={[0.8, 1.2, 1.26]}>
          <planeGeometry args={[0.5, 0.5]} />
          <meshStandardMaterial color="#87ceeb" emissive="#444" />
@@ -275,8 +363,24 @@ const Rock: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
   </mesh>
 ));
 
+const Signpost: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
+  <group position={[data.position.x, data.position.y, data.position.z]} rotation={[0, data.rotation + Math.PI/2, 0]} scale={[1, 1, 1]}>
+    <mesh position={[0, 0.75, 0]} castShadow>
+        <cylinderGeometry args={[0.05, 0.05, 1.5]} />
+        <meshStandardMaterial color="#3e2723" />
+    </mesh>
+    <mesh position={[0, 1.3, 0]} rotation={[0, 0, 0]} castShadow>
+        <boxGeometry args={[0.6, 0.15, 0.02]} />
+        <meshStandardMaterial color="#8B4513" />
+    </mesh>
+     <mesh position={[0, 1.1, 0]} rotation={[0, 0.3, 0]} castShadow>
+        <boxGeometry args={[0.6, 0.15, 0.02]} />
+        <meshStandardMaterial color="#8B4513" />
+    </mesh>
+  </group>
+));
+
 const Mountain: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
-    // Deprecated for procedural terrain, but kept for legacy ID support if needed
   <mesh position={[data.position.x, data.position.y - 5, data.position.z]} rotation={[0, data.rotation, 0]} scale={[data.scale.x, data.scale.y, data.scale.z]}>
     <coneGeometry args={[1, 1, 4]} />
     <meshStandardMaterial color="#2d2d2d" roughness={1} />
@@ -299,7 +403,6 @@ const Ruin: React.FC<{ data: Obstacle }> = React.memo(({ data }) => (
     </mesh>
   </group>
 ));
-
 
 // --- Game Components ---
 
@@ -352,14 +455,14 @@ const Weapon = ({ isFiring, isReloading }: { isFiring: boolean; isReloading: boo
   );
 };
 
-const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; type: EnemyType }> = ({ position, hp, maxHp, type }) => {
+const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; type: EnemyType, seed: number }> = ({ position, hp, maxHp, type, seed }) => {
   const mesh = useRef<THREE.Group>(null);
   const config = ENEMY_CONFIG[type];
   
   useFrame((state) => {
     if (!mesh.current) return;
     const bobSpeed = type === 'peasant' || type === 'villager' ? 15 : type === 'heavy' ? 5 : 10;
-    const terrainH = getTerrainHeight(position.x, position.z);
+    const terrainH = getTerrainHeight(position.x, position.z, seed);
     mesh.current.position.y = terrainH + (0.75 * config.scale) + Math.sin(state.clock.getElapsedTime() * bobSpeed + position.x) * 0.1;
   });
 
@@ -374,7 +477,6 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
         <meshStandardMaterial color={config.color} roughness={0.9} />
       </mesh>
       
-      {/* Head */}
       <mesh position={[0, 0.9, 0]}>
         <sphereGeometry args={[0.25]} />
         <meshStandardMaterial 
@@ -384,7 +486,6 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
         />
       </mesh>
       
-      {/* Villager Hat */}
       {isVillager && (
           <mesh position={[0, 1.1, 0]}>
               <cylinderGeometry args={[0.3, 0.3, 0.05]} />
@@ -399,7 +500,6 @@ const EnemyMesh: React.FC<{ position: ThreeVector3; hp: number; maxHp: number; t
         </mesh>
       )}
 
-      {/* Arms/Weapon */}
       {!isVillager && (
         <group position={[0.4, 0.2, 0.2]} rotation={[1, 0, 0]}>
             <mesh>
@@ -460,7 +560,7 @@ const Tracers = ({ tracers }: { tracers: { start: ThreeVector3; end: ThreeVector
 }
 
 // Manages the visible terrain patches
-const World = ({ obstacles, playerPos }: { obstacles: Obstacle[], playerPos: THREE.Vector3 }) => {
+const World = ({ obstacles, playerPos, seed }: { obstacles: Obstacle[], playerPos: THREE.Vector3, seed: number }) => {
     const cx = Math.floor(playerPos.x / CHUNK_SIZE);
     const cz = Math.floor(playerPos.z / CHUNK_SIZE);
     
@@ -482,9 +582,9 @@ const World = ({ obstacles, playerPos }: { obstacles: Obstacle[], playerPos: THR
       <ambientLight intensity={0.5} />
       <pointLight position={[10, 50, 10]} intensity={1} castShadow />
       
-      {/* Dynamic Terrain */}
+      {/* Dynamic Terrain - Now depends on SEED */}
       {visibleChunks.map(chunk => (
-          <TerrainChunk key={chunk.key} x={chunk.x} z={chunk.z} />
+          <TerrainChunk key={chunk.key} x={chunk.x} z={chunk.z} seed={seed} />
       ))}
       
       {/* Obstacles */}
@@ -495,6 +595,7 @@ const World = ({ obstacles, playerPos }: { obstacles: Obstacle[], playerPos: THR
           case 'ruin': return <Ruin key={obs.id} data={obs} />;
           case 'mountain': return <Mountain key={obs.id} data={obs} />;
           case 'house': return <House key={obs.id} data={obs} />;
+          case 'signpost': return <Signpost key={obs.id} data={obs} />;
           default: return null;
         }
       })}
@@ -523,13 +624,22 @@ const checkCollision = (position: THREE.Vector3, obstacles: Obstacle[], radius: 
 // Monitors player position and updates the global obstacles list
 const WorldGenerator = ({ 
     playerRef, 
-    setObstacles 
+    setObstacles,
+    seed
 }: { 
     playerRef: React.MutableRefObject<THREE.Vector3>, 
-    setObstacles: React.Dispatch<React.SetStateAction<Obstacle[]>> 
+    setObstacles: React.Dispatch<React.SetStateAction<Obstacle[]>>,
+    seed: number
 }) => {
     const loadedChunks = useRef<Set<string>>(new Set());
     const lastChunk = useRef<{x: number, z: number} | null>(null);
+
+    // Reset generator when seed changes
+    useEffect(() => {
+        loadedChunks.current.clear();
+        lastChunk.current = null;
+        // Obstacles are cleared in handleStart
+    }, [seed]);
 
     useFrame(() => {
         const px = playerRef.current.x;
@@ -550,7 +660,7 @@ const WorldGenerator = ({
                     
                     if (!loadedChunks.current.has(key)) {
                         loadedChunks.current.add(key);
-                        newObstacles.push(...generateChunk(x, z));
+                        newObstacles.push(...generateChunk(x, z, seed)); // Pass SEED
                     }
                 }
             }
@@ -589,7 +699,8 @@ const GameController = ({
     onShoot,
     enemiesRef,
     playerRef,
-    obstacles
+    obstacles,
+    seed
 }: { 
     onScore: (pts: number) => void, 
     onDamage: (dmg: number) => void, 
@@ -598,7 +709,8 @@ const GameController = ({
     onShoot: (fired: boolean) => void,
     enemiesRef: React.MutableRefObject<Enemy[]>,
     playerRef: React.MutableRefObject<THREE.Vector3>,
-    obstacles: Obstacle[]
+    obstacles: Obstacle[],
+    seed: number
 }) => {
   const { camera } = useThree();
   const [enemies, setEnemies] = useState<Enemy[]>([]);
@@ -610,6 +722,12 @@ const GameController = ({
   const ammoRef = useRef(MAX_AMMO);
   const isReloading = useRef(false);
   
+  // Clear enemies when seed changes (new game)
+  useEffect(() => {
+    setEnemies([]);
+    camera.position.set(0, 5, 0); // Reset position
+  }, [seed, camera]);
+
   useEffect(() => {
     enemiesRef.current = enemies;
   }, [enemies]);
@@ -669,9 +787,8 @@ const GameController = ({
     }
 
     // --- SNAP TO TERRAIN ---
-    // Important: Keep player above ground
-    const groundH = getTerrainHeight(camera.position.x, camera.position.z);
-    // Smooth transition or hard snap? Hard snap for walking.
+    // Pass SEED to terrain height calculation
+    const groundH = getTerrainHeight(camera.position.x, camera.position.z, seed);
     camera.position.y = groundH + 1.7; 
 
     // --- Shooting ---
@@ -740,11 +857,10 @@ const GameController = ({
       const dist = 30 + Math.random() * 20;
       const spawnX = camera.position.x + Math.cos(angle) * dist;
       const spawnZ = camera.position.z + Math.sin(angle) * dist;
-      const spawnY = getTerrainHeight(spawnX, spawnZ);
+      const spawnY = getTerrainHeight(spawnX, spawnZ, seed);
       
       const rand = Math.random();
       let type: EnemyType = 'knight';
-      // 20% Villager, 30% Peasant, 40% Knight, 10% Heavy
       if (rand < 0.2) type = 'villager';
       else if (rand < 0.5) type = 'peasant';
       else if (rand > 0.9) type = 'heavy';
@@ -774,10 +890,8 @@ const GameController = ({
             const pVec = new THREE.Vector3(camera.position.x, 0, camera.position.z);
             const dist = eVec.distanceTo(pVec);
             
-            // Villager AI: Passive / Flee
             if (e.type === 'villager') {
                 if (dist < 10) {
-                   // Flee from player
                    const dir = eVec.sub(pVec).normalize();
                    const moveVec = dir.multiplyScalar(e.speed * delta);
                    const nextPos = new THREE.Vector3(e.position.x, 0, e.position.z).add(moveVec);
@@ -786,7 +900,6 @@ const GameController = ({
                         return { ...e, position: { x: nextPos.x, y: 0, z: nextPos.z }, isAttacking: false };
                    }
                 } else {
-                   // Wander randomly (simple jitter)
                    if (Math.random() < 0.05) {
                        const angle = Math.random() * Math.PI * 2;
                        const moveVec = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)).multiplyScalar(e.speed * delta * 0.5);
@@ -799,7 +912,6 @@ const GameController = ({
                 return { ...e, isAttacking: false };
             }
 
-            // Aggressive Enemy AI
             const config = ENEMY_CONFIG[e.type];
             const attackRange = 1.5 * config.scale;
 
@@ -809,7 +921,6 @@ const GameController = ({
                 const nextPos = eVec.clone().add(moveVec);
 
                 if (!checkCollision(nextPos, obstacles, 0.5)) {
-                    // Update Y later in render loop, just update XZ here
                     return { ...e, position: { x: nextPos.x, y: 0, z: nextPos.z }, isAttacking: false };
                 }
                 return { ...e, isAttacking: false };
@@ -837,6 +948,7 @@ const GameController = ({
             hp={e.hp} 
             maxHp={e.maxHp}
             type={e.type}
+            seed={seed}
         />
       ))}
       <Tracers tracers={tracers} />
@@ -886,6 +998,8 @@ export default function App() {
   const [isFiring, setIsFiring] = useState(false);
   const [joystickData, setJoystickData] = useState({ x: 0, y: 0 });
   const [obstacles, setObstacles] = useState<Obstacle[]>([]);
+  // Global Seed for Unique World Generation
+  const [worldSeed, setWorldSeed] = useState(Math.random() * 10000);
 
   // Refs
   const enemiesRef = useRef<Enemy[]>([]);
@@ -909,6 +1023,10 @@ export default function App() {
   }, [gameState.health < 30]);
 
   const handleStart = () => {
+    // Generate new world seed on start/restart
+    const newSeed = Math.random() * 10000;
+    setWorldSeed(newSeed);
+    setObstacles([]); // Clear previous world obstacles
     setGameState(prev => ({ ...prev, isPlaying: true, health: 100, score: 0 }));
   };
 
@@ -1017,8 +1135,8 @@ export default function App() {
             <Canvas shadows camera={{ fov: 75, position: [0, 5, 0] }}>
                 <Suspense fallback={null}>
                     {/* Pass player pos to World to render correct chunks */}
-                    <World obstacles={obstacles} playerPos={playerRef.current} />
-                    <WorldGenerator playerRef={playerRef} setObstacles={setObstacles} />
+                    <World obstacles={obstacles} playerPos={playerRef.current} seed={worldSeed} />
+                    <WorldGenerator playerRef={playerRef} setObstacles={setObstacles} seed={worldSeed} />
                     {gameState.isPlaying && (
                         <>
                             <PointerLockControls selector="#root" /> 
@@ -1032,6 +1150,7 @@ export default function App() {
                                 enemiesRef={enemiesRef}
                                 playerRef={playerRef}
                                 obstacles={obstacles}
+                                seed={worldSeed}
                             />
                             <WeaponRig isFiring={isFiring} isReloading={gameState.ammo === 0 && isFiring} />
                         </>
