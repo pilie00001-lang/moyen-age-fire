@@ -14,23 +14,29 @@ export interface Enemy {
   maxHp: number;
   speed: number;
   isAttacking: boolean;
+  isDead?: boolean;
+  deadTime?: number;
+  velocity?: Vector3;
 }
 
 export interface Obstacle {
   id: string;
-  type: 'tree' | 'rock' | 'ruin' | 'mountain' | 'house' | 'signpost';
+  type: 'tree' | 'rock' | 'ruin' | 'mountain' | 'wall' | 'roof' | 'shop_table' | 'well' | 'signpost';
   position: Vector3;
   rotation: number;
   scale: Vector3;
-  radius: number; // Collision radius
+  radius: number; // Used for cylindrical collision (trees, rocks)
+  dims?: { w: number, d: number, h: number }; // New: Used for box collision (walls)
 }
 
 export interface GameState {
   score: number;
+  gold: number; // New: Currency
   health: number;
   wave: number;
   isPlaying: boolean;
   ammo: number;
+  damageMultiplier: number; // New: Upgrade tracking
 }
 
 export enum WeaponState {
@@ -39,4 +45,4 @@ export enum WeaponState {
   RELOADING
 }
 
-export type CommentaryType = 'intro' | 'killstreak' | 'low_health' | 'wave_start';
+export type CommentaryType = 'intro' | 'killstreak' | 'low_health' | 'wave_start' | 'shop_buy';

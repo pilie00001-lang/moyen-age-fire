@@ -68,7 +68,7 @@ export const Joystick: React.FC<JoystickProps> = ({ onMove }) => {
 
   return (
     <div 
-      className="absolute bottom-10 left-10 w-28 h-28 bg-gray-900/50 rounded-full backdrop-blur-sm border-2 border-white/20 touch-none select-none z-50 flex items-center justify-center"
+      className="absolute bottom-10 left-10 w-28 h-28 bg-gray-900/50 rounded-full backdrop-blur-sm border-2 border-white/20 touch-none select-none z-50 flex items-center justify-center pointer-events-auto"
       ref={containerRef}
       onMouseDown={onMouseDown}
       onTouchStart={onTouchStart}
